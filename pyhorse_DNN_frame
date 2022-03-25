@@ -1,0 +1,366 @@
+import numpy as np
+from dnn_utils import *
+import DNN_functions
+import matplotlib.pyplot as plt
+import image_data
+import DNN_data_operate
+
+class dnn_model(DNN_data_operate.data_process):
+    np.random.seed(1)
+    """
+                 L2        ,     [bool,lambd]                      back
+              drop_out           [bool,keep_prob]                  front,back
+            # normalization        bool
+             mini_batch          [bool,mini_size]                  front
+               adam              [bool,belt1,belt2]   belt1 for momentum , belt2 for RMSprop      back
+        learning_rate_delay      [bool,delay_rate]                 iter
+        batch_normalization      bool                              front
+    """
+
+    def linear_forward(self,a, w, b):
+        """
+        linear forward calculation of one step
+
+        :param a:   np.array , layer input
+        :param w:   np.array , weight
+        :param b:   np.array , bias
+        :return:
+            z:  np.array , output
+        cache:     tutle , (input,weight,bias)
+        """
+        if self.batch_normalization:
+            n_x = a.shape[0]
+            miu = np.sum(a, axis=0) / n_x
+            y = a - miu
+            theta = np.sum(y ** 2, axis=0) / n_x
+            y /= theta**(1/2)
+            a=y
+        z = np.dot(w, a) + b
+        assert (z.shape == (w.shape[0], a.shape[1]))
+
+        if self.drop_out:
+            self.drop_out_d=np.random.randn(z.shape[0],z.shape[1])
+            self.drop_out_d = self.drop_out_d < self.keep_prob
+            self.drop_out_d = self.drop_out_d + 0
+            assert (self.drop_out_d.shape == z.shape)
+        cache = (a, w, b)
+        return z, cache  # output (input,w,b)
+
+    def linear_activation_forward(self,a_prev, w, b, activation):  # input,w,b,actFunc
+        """
+        activation forward calculation of one step
+
+        :param a_prev:   np.array , input
+        :param w:        np.array , weight
+        :param b:        np.array , bias
+        :param activation: string , activation function
+        :return:
+                  a:   np.array , output
+              cache:      tutle , ((input,weight,bias),linear output)
+        """
+        z, linear_cache = self.linear_forward(a_prev, w, b)
+        if activation == "sigmoid":
+            a, activation_cache = sigmoid(z)
+        elif activation == "relu":
+            a, activation_cache = relu(z)
+
+        assert (a.shape == (w.shape[0], a_prev.shape[1]))
+        cache = (linear_cache, activation_cache)  # (prev_a,w,b,z)
+        return a, cache  # output (input,w,b,output)
+
+    def L_model_forward(self,x):  # modelInput , initial W And B
+        """
+        forward transport for one time
+
+        :param x:   np.array , model input
+        :return:
+                 al:  np.array , preview
+             caches:     tutle , (((input,weight,bias),linear output),((input,weight,bias),linear output))
+        """
+        caches = []  # (a,w,b),z
+        a = x
+        L = len(self.parameters) // 3  # layer number
+        for l in range(1, L):
+            a_prev = a
+            a, cache = self.linear_activation_forward(a_prev, self.parameters["w" + str(l)], self.parameters["b" + str(l)], self.parameters["activation" + str(l)])
+            caches.append(cache)
+        al, cache = self.linear_activation_forward(a, self.parameters["w" + str(L)], self.parameters["b" + str(L)], self.parameters["activation" + str(L)])
+        caches.append(cache)
+        assert (al.shape == (1, x.shape[1]))
+        return al, caches
+
+    def compute_cost(self,al, y):  # pred , y
+        """
+        calculate cost
+
+        :param al:   np.array , preview
+        :param y:    np.array , train set y
+        :return:        float , cost
+        """
+        m = y.shape[1]
+        cost = -np.sum(np.multiply(np.log(al), y) + np.multiply(np.log(1 - al), 1 - y)) / m
+        cost = np.squeeze(cost)
+        assert (cost.shape == ())
+        return cost
+
+    def linear_backward(self,dz, cache):  # dz (prev_a,w,b)
+        """
+        linear backward calculate for one layer
+
+        :param dz:     np.array , dcost/dz
+        :param cache:     tutle , (layer output,weight,bias)
+        :return:
+                  da_prev:    np.array , dcost/da
+                       dw:    np.array , dcost/dw
+                       db:    np.array , dcost/db
+        """
+        a_prev, w, b = cache  # pre a,
+        m = a_prev.shape[1]  # number
+        dw = np.dot(dz, a_prev.T) / m  # dw=dz*a
+        db = np.sum(dz, axis=1, keepdims=True) / m  # db=dz
+        da_prew = np.dot(w.T, dz)  # da=w*dz
+        if self.L2:
+            dw += (self.lambd * w) / m
+        if self.drop_out:
+            da_prew *= self.drop_out_d
+        assert (da_prew.shape == a_prev.shape)
+        assert (dw.shape == w.shape)
+        assert (db.shape == b.shape)
+        return da_prew, dw, db
+
+    def linear_activation_backward(self,da, cache,activation):
+        """
+        activation backward layer
+
+        :param da:       np.array , da
+        :param cache:       tutle , ((a,w,b),z)
+        :param activation: string , activation function
+        :return:  np.array , da,dw,db
+        """
+        linear_cache, activation_cache = cache
+        if activation == "relu":
+            dz = relu_backward(da, activation_cache)  # drelu   z
+        elif activation == "sigmoid":
+            dz = sigmoid_backward(da, activation_cache)
+        da_prev, dw, db = self.linear_backward(dz, linear_cache)
+        return da_prev, dw, db
+
+    def L_model_backward(self,al, y, caches):
+        """
+        totally backward transport for one time
+
+        :param al:        np.array , preview
+        :param y:         np.array , train set y
+        :param caches:       tutle , (((a,w,b),z),((a,w,b),z))
+        :return:        dictionary , dw db da
+        """
+        grads = {}  # dw db da
+        L = len(caches)  # L
+        m = al.shape[1]  # number
+        y = y.reshape(al.shape)
+        dal = -(np.divide(y, al) - np.divide(1 - y, 1 - al))  # dcost
+        current_cache = caches[L - 1]
+        grads["da" + str(L)], grads["dw" + str(L)], grads["db" + str(L)] = self.linear_activation_backward(dal,current_cache,self.parameters['activation'+str(L)])
+        for l in reversed(range(L - 1)):
+            current_cache = caches[l]
+            da_prev_temp, dw_temp, db_temp = self.linear_activation_backward(grads["da" + str(l + 2)], current_cache,self.parameters['activation'+str(l+1)])
+            grads["da" + str(l + 1)] = da_prev_temp
+            grads["dw" + str(l + 1)] = dw_temp
+            grads["db" + str(l + 1)] = db_temp
+        return grads
+
+    def update_parameters(self, grads):
+        """
+        model learning
+
+        :param grads:   dictionary , da dw db
+        :return:        dictionary , new parameters
+        """
+        L = len(self.parameters) // 3
+        if self.adam:
+            prev_grads = self.grads
+            for l in range(L):
+                prev_dw=prev_grads['dw'+str(l+1)]
+                dw=grads['dw'+str(l+1)]
+                s_dw=self.belt2*prev_dw+(1-self.belt2)*dw**2
+                v_dw=self.belt1*prev_dw+(1-self.belt1)*dw
+                dw=v_dw/(np.sqrt(s_dw)+self.thelo)
+                prev_db = prev_grads['db' + str(l + 1)]
+                db = grads['db' + str(l + 1)]
+                s_db = self.belt2 * prev_db + (1 - self.belt2) * db ** 2
+                v_db = self.belt1 * prev_db + (1 - self.belt1) * db
+                db = v_db / (np.sqrt(s_db) + self.thelo)
+                grads['dw'+str(l+1)]=dw
+                grads['db'+str(l+1)]=db
+                self.parameters["w" + str(l + 1)] = self.parameters["w" + str(l + 1)] - self.learning_rate * dw
+                self.parameters["b" + str(l + 1)] = self.parameters["b" + str(l + 1)] - self.learning_rate * db
+        else:
+            for l in range(L):
+                self.parameters["w" + str(l + 1)] = self.parameters["w" + str(l + 1)] - self.learning_rate * grads["dw" + str(l + 1)]
+                self.parameters["b" + str(l + 1)] = self.parameters["b" + str(l + 1)] - self.learning_rate * grads["db" + str(l + 1)]
+        parameters=self.parameters
+        self.grads=grads
+        return parameters
+
+    def predict(self,x):
+        """
+        predict by input x
+
+        :param x:   np.array , predicted data
+        :return:    np.array , predict result
+        """
+        al, caches = self.L_model_forward(x)
+        Y_prediction=al
+        return Y_prediction
+
+    def estimate(self):
+        """
+        estimate model performance
+
+        :return:  none
+        """
+        y_prediction_train = self.predict(self.train_x)
+        y_prediction_test = self.predict(self.test_x)
+        print("训练准确性:", format(100 - np.mean(np.abs(y_prediction_train - self.train_y)) * 100), "%")
+        print("测试准确性:", format(100 - np.mean(np.abs(y_prediction_test - self.test_y)) * 100), "%")
+
+    def train(self,num_iterations=None,parameters_path=None,train_path=None,learning_rate=None):
+        """
+        train the model
+
+        :param num_iterations:      int , iteration time
+        :param parameters_path:  string , parameters folder path
+        :param train_path:       string , train x path
+        :param learning_rate:     float , learning rate
+        :return:    none
+        """
+        if learning_rate is not None:
+            self.learning_rate=None
+        if train_path is not None:
+            self.train_x=np.load(train_path[0])
+            self.train_y=np.load(train_path[1])
+        if parameters_path is not None:
+            self.parameters_path=parameters_path
+            self.parameters=DNN_functions.read_parameters(parameters_path)
+        if num_iterations is not None:
+            self.num_iterations=num_iterations
+        np.random.seed(1)
+        costs = []
+        if self.learning_rate_delay:
+            if self.mini_batch:
+                start=0
+                size=self.train_y.shape[1]
+                for i in range(0, self.num_iterations):
+                    end=min(start+self.mini_size,size)
+                    al, caches = self.L_model_forward(self.train_x.T[start:end].T)
+
+                    cost = self.compute_cost(al, self.train_y.T[start:end].T)
+
+                    grads = self.L_model_backward(al, self.train_y.T[start:end].T, caches)
+                    parameters = self.update_parameters(grads)
+                    self.learning_rate /= (1+self.delay_rate*i)
+                    start=end if end<size else 0
+                    if i % 50 == 0:
+                        costs.append(cost)
+                        print("第", i, "次迭代，成本为:", np.squeeze(cost))
+                    if i % 500 == 0:
+                        DNN_functions.save_parameters(parameters, self.parameters_path)
+            else:
+                for i in range(0, self.num_iterations):
+                    al, caches = self.L_model_forward(self.train_x)
+                    cost = self.compute_cost(al, self.train_y)
+                    grads = self.L_model_backward(al, self.train_y, caches)
+                    parameters = self.update_parameters(grads)
+                    self.learning_rate /= (1+self.delay_rate*i)
+                    if i % 50 == 0:
+                        costs.append(cost)
+                        print("第", i, "次迭代，成本为:", np.squeeze(cost))
+                    if i % 500 == 0:
+                        DNN_functions.save_parameters(parameters, self.parameters_path)
+        else:
+            if self.mini_batch:
+                start=0
+                size=self.train_y.shape[1]
+                for i in range(0, self.num_iterations):
+                    end=min(start+self.mini_size,size)
+                    al, caches = self.L_model_forward(self.train_x.T[start:end].T)
+
+                    cost = self.compute_cost(al, self.train_y.T[start:end].T)
+
+                    grads = self.L_model_backward(al, self.train_y.T[start:end].T, caches)
+                    parameters = self.update_parameters(grads)
+                    self.learning_rate /= (1+self.delay_rate*i)
+                    start=end if end<size else 0
+                    if i % 50 == 0:
+                        costs.append(cost)
+                        print("第", i, "次迭代，成本为:", np.squeeze(cost))
+                    if i % 500 == 0:
+                        DNN_functions.save_parameters(parameters, self.parameters_path)
+            else:
+                for i in range(0, self.num_iterations):
+                    al, caches = self.L_model_forward(self.train_x)
+                    cost = self.compute_cost(al, self.train_y)
+                    grads = self.L_model_backward(al, self.train_y, caches)
+                    parameters = self.update_parameters(grads)
+                    if i % 50 == 0:
+                        costs.append(cost)
+                        print("第", i, "次迭代，成本为:", np.squeeze(cost))
+                    if i % 500 == 0:
+                        DNN_functions.save_parameters(parameters,self.parameters_path)
+        self.estimate()
+        plt.plot(np.squeeze(costs))
+        plt.ylabel('cost')
+        plt.xlabel('iterations(per hundreds)')
+        plt.title('learning rate=' + str(self.learning_rate))
+        plt.show()
+        print("\nlisted below are adapted:")
+        if self.L2:
+            print("L2")
+        if self.drop_out:
+            print("drop_out")
+        if self.mini_batch:
+            print("mini_batch")
+        if self.adam:
+            print("adam")
+        if self.learning_rate_delay:
+            print("learning_rate_delay")
+        if self.batch_normalization:
+            print("batch_normalization")
+        print("list over\n")
+
+    def work(self,path=None,after=None):
+        """
+        work , put into use
+
+        :param path:   string , recognized pictuer
+        :param after:    list , out put range
+        :return:        float , work result
+        """
+        if path is not None:
+            self.work_path=path
+        image_data.single_ensmall(self.work_path)
+        pic = np.array([image_data.get_single_x(self.work_path)])
+        print("show picture")
+        image_data.showPicture(pic)
+        x = pic.reshape(pic.shape[0], -1).T / 255
+        x = DNN_functions.normalizing_training_sets(x)
+        al, caches = self.L_model_forward(x)
+        Y_prediction = al
+        if after is not None:
+            c,d=after[0],after[1]
+            Y_prediction=Y_prediction*(d-c)+c
+        return np.squeeze(Y_prediction)
+
+    def save_parameters(self,parameters_path=None):
+        """
+        save parameters to a folder
+
+        :param parameters_path:   string , folder path
+        :return:
+        """
+        if parameters_path is None:
+            DNN_functions.save_parameters(self.parameters)
+        else:
+            DNN_functions.save_parameters(self.parameters,parameters_path)
+
+
